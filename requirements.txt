@@ -1,0 +1,4 @@
+ijson>=3.2.0
+beautifulsoup4>=4.12.0
+# Для --transcribe (голосовые и видео → текст): pip install openai-whisper; в системе нужен ffmpeg
+# openai-whisper>=20231117

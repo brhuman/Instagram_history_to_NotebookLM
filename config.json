@@ -1,0 +1,9 @@
+{
+  "max_file_size_mb": 25,
+  "max_objects_per_file": 15000,
+  "max_words_per_file": 450000,
+  "array_path": "messages",
+  "output_format": "md",
+  "author_at_top": true,
+  "skip_empty_messages": true
+}

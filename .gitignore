@@ -1,0 +1,7 @@
+# Ignore src/ and dist/ contents; src/ is in repo via .gitkeep only
+src/*
+!src/.gitkeep
+dist/
+.venv/
+__pycache__/
+*.pyc
