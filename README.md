@@ -1,47 +1,47 @@
 # Instagram Export → NotebookLM
 
-Этот проект обрабатывает **только экспорт данных Instagram** (логи, переписки, профиль, активность) и конвертирует их в один Markdown-файл для загрузки в [NotebookLM](https://notebooklm.google/).
+This project processes **Instagram data export only** (logs, DMs, profile, activity) and converts it into a single Markdown file for [NotebookLM](https://notebooklm.google/).
 
-## Как это работает
+## How it works
 
-1. **Instagram** — скачайте свои данные через Настройки → Аккаунт → Загрузка данных (формат JSON).
-2. Положите папку экспорта в **src/** (или укажите путь к ней аргументом).
-3. Запустите **instagram_export_to_md.py** — скрипт соберёт один `.md` с разделами:
-   - **Профиль** (имя, username, email, дата рождения и т.д.)
-   - **Социальные связи** (подписки, подписчики, близкие друзья)
-   - **Переписки** (все чаты из inbox, сообщения по времени)
-   - **Активность** (лайки постов и комментариев, сохранённое, посты Threads, мои комментарии)
-   - **Повторяющиеся темы**
-4. Результат: `dist/<имя_папки_экспорта>/<имя_папки_экспорта>_notebooklm.md` — готов к загрузке в NotebookLM.
+1. **Instagram** — download your data via Settings → Account → Download your information (JSON format).
+2. Put the export folder in **src/** (or pass its path as an argument).
+3. Run **instagram_export_to_md.py** — the script builds one `.md` with sections:
+   - **Profile** (name, username, email, date of birth, etc.)
+   - **Connections** (following, followers, close friends)
+   - **Conversations** (all inbox chats, messages in chronological order)
+   - **Activity** (liked posts and comments, saved posts, Threads posts, your comments)
+   - **Suggested topics**
+4. Output: `dist/<export_folder_name>/<export_folder_name>_notebooklm.md` — ready to upload to NotebookLM.
 
-Медиа (фото/видео) в файл не включаются; голосовые сообщения можно опционально транскрибировать через Whisper.
+Media (photos/videos) are not included; voice messages can optionally be transcribed via Whisper.
 
-## Установка
+## Setup
 
 ```bash
 python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
-# Опционально, для транскрипции голосовых:
-pip install openai-whisper   # и установите ffmpeg в системе
+# Optional, for voice transcription:
+pip install openai-whisper   # and install ffmpeg on your system
 ```
 
-## Команды
+## Commands
 
-| Команда | Описание |
-|--------|----------|
-| `python3 instagram_export_to_md.py` | Конвертация: папка экспорта из **src/** → **dist/** |
-| `python3 instagram_export_to_md.py src/MyInstagramExport` | Указать папку с экспортом Instagram |
-| `python3 instagram_export_to_md.py -o /path/to/out` | Папка для выходного .md (по умолчанию **dist/**) |
-| `python3 instagram_export_to_md.py --no-transcribe` | Не транскрибировать голосовые (быстрее) |
+| Command | Description |
+|--------|-------------|
+| `python3 instagram_export_to_md.py` | Convert: export folder from **src/** → **dist/** |
+| `python3 instagram_export_to_md.py src/MyInstagramExport` | Specify Instagram export folder |
+| `python3 instagram_export_to_md.py -o /path/to/out` | Output directory for .md (default **dist/**) |
+| `python3 instagram_export_to_md.py --no-transcribe` | Skip voice transcription (faster) |
 
-## Требования к экспорту Instagram
+## Instagram export requirements
 
-В корне папки экспорта должны быть:
+The export folder must contain at its root:
 
 - `personal_information/personal_information/personal_information.json`
 - `your_instagram_activity/messages/inbox/`
 
-Скрипт может найти такую папку и во вложенных подпапках внутри **src/**.
+The script can find this folder in nested subfolders inside **src/** as well.
 
 ---
 
-В репозитории также лежат скрипты **export_to_md.py** (экспорт Telegram) и **split_json.py** (разбиение больших JSON) — они не относятся к обработке Instagram и сохранены для смежных задач.
+This repo also contains **export_to_md.py** (Telegram export) and **split_json.py** (splitting large JSON files) — they are not used for Instagram and are kept for related use cases.
