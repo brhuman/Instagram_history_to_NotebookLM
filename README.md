@@ -1,6 +1,6 @@
 # Instagram Export → NotebookLM
 
-Takes an **Instagram data export** (JSON) and turns it into Markdown for [NotebookLM](https://notebooklm.google/): profile, connections, DMs, activity, and suggested topics. Voice messages can be transcribed with Whisper. Output is one big `.md` (or split by word limit), or one `.md` per chat plus a shared profile/activity file.
+Takes an **Instagram data export** (JSON) and turns it into Markdown for [NotebookLM](https://notebooklm.google/): profile, connections, DMs, activity, and suggested topics. Voice messages can be transcribed with Whisper. **Default output:** one `.md` per chat (named by the other participant) plus one `00_profile_and_activity.md` in `dist/<export_name>_export/`. Use `--single-file` to get one big `.md` (or split by word limit) instead.
 
 ---
 
@@ -9,8 +9,7 @@ Takes an **Instagram data export** (JSON) and turns it into Markdown for [Notebo
 1. Request your data from Instagram (Settings → Account → Download your information, JSON).
 2. Put the unzipped export folder in **src/** or pass its path.
 3. Run **instagram_export_to_md.py**. It reads the export, normalizes text and emoji, optionally transcribes voice messages (Whisper), and writes Markdown to **dist/**.
-4. **Default output:** one file (or several by word limit) in `dist/<export_folder_name>/`.  
-   **With `--split-by-chats`:** folder `dist/<export_folder_name>_export/` with one `.md` per conversation (named by the other participant) and `00_profile_and_activity.md`.
+4. **Default output:** folder `dist/<export_folder_name>_export/` with one `.md` per conversation (filename = other participant) and `00_profile_and_activity.md`. Use **`--single-file`** to get one big `.md` (or several by word limit) in `dist/<export_folder_name>/` instead.
 
 Photos and videos are not included; only text, links, and transcribed audio.
 
@@ -58,10 +57,10 @@ python3 instagram_export_to_md.py --no-transcribe
 python3 instagram_export_to_md.py --max-words 450000
 ```
 
-**One .md per chat** plus profile/activity file (filenames = other participant names):
+**One big .md file** (or several by word limit) instead of one file per chat:
 
 ```bash
-python3 instagram_export_to_md.py --split-by-chats
+python3 instagram_export_to_md.py --single-file
 ```
 
 **Collapse consecutive “Liked a message” / “Reacted …”** into one line:
@@ -76,10 +75,10 @@ python3 instagram_export_to_md.py --collapse-actions
 python3 instagram_export_to_md.py --whisper-model small
 ```
 
-**Example:** split by chats, no transcription, custom output:
+**Example:** no transcription, custom output (default: one file per chat):
 
 ```bash
-python3 instagram_export_to_md.py src/ -o dist/ --split-by-chats --no-transcribe
+python3 instagram_export_to_md.py src/ -o dist/ --no-transcribe
 ```
 
 ---

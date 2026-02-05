@@ -132,27 +132,39 @@ def load_json_safe(root: str, *path_parts: str) -> dict | list | None:
         return None
 
 
+def _inbox_candidate_paths(root: str) -> list[str]:
+    """Возможные пути к папке переписок (inbox) от корня экспорта."""
+    return [
+        os.path.join(root, "your_instagram_activity", "messages", "inbox"),
+        os.path.join(root, "messages", "inbox"),
+        os.path.join(root, "content", "messages", "inbox"),
+    ]
+
+
 def find_instagram_export_root(path: str) -> str | None:
     """
     Ищет корень экспорта Instagram: папка должна содержать
     personal_information/personal_information/personal_information.json
-    и your_instagram_activity/messages/inbox/
+    и папку переписок (inbox) по одному из путей: your_instagram_activity/messages/inbox, messages/inbox, content/messages/inbox.
     """
     path = os.path.abspath(path)
     if not os.path.isdir(path):
         return None
     profile = os.path.join(path, "personal_information", "personal_information", "personal_information.json")
-    inbox = os.path.join(path, "your_instagram_activity", "messages", "inbox")
-    if os.path.isfile(profile) and os.path.isdir(inbox):
-        return path
-    # Поиск в подпапках (например src/instagram-.../)
-    for name in sorted(os.listdir(path)):
-        sub = os.path.join(path, name)
-        if os.path.isdir(sub) and not name.startswith("."):
-            found = find_instagram_export_root(sub)
-            if found:
-                return found
-    return None
+    if not os.path.isfile(profile):
+        # Поиск в подпапках (например src/instagram-.../)
+        for name in sorted(os.listdir(path)):
+            sub = os.path.join(path, name)
+            if os.path.isdir(sub) and not name.startswith("."):
+                found = find_instagram_export_root(sub)
+                if found:
+                    return found
+        return None
+    for inbox in _inbox_candidate_paths(path):
+        if os.path.isdir(inbox):
+            return path
+    # Профиль есть, но inbox не найден — всё равно считаем это корнем (переписки могут быть пустыми)
+    return path
 
 
 def transcribe_audio(file_path: str, model_size: str = "medium") -> str:
@@ -376,8 +388,14 @@ def load_inbox_conversations(root: str, transcribe_fn, log=None, collapse_action
     """
     if log is None:
         log = _log_noop
-    inbox_dir = os.path.join(root, "your_instagram_activity", "messages", "inbox")
-    if not os.path.isdir(inbox_dir):
+    inbox_candidates = _inbox_candidate_paths(root)
+    inbox_dir = None
+    for candidate in inbox_candidates:
+        if os.path.isdir(candidate):
+            inbox_dir = candidate
+            break
+    if not inbox_dir:
+        log(f"  Предупреждение: папка переписок не найдена. Проверено: {inbox_candidates[0]} и др.")
         return []
 
     folders = sorted([f for f in os.listdir(inbox_dir) if os.path.isdir(os.path.join(inbox_dir, f))])
@@ -849,9 +867,9 @@ def main() -> int:
         help="Подряд идущие «Liked a message» / «Reacted …» сворачивать в одну строку «Несколько лайков/реакций подряд».",
     )
     parser.add_argument(
-        "--split-by-chats",
+        "--single-file",
         action="store_true",
-        help="В dist создавать папку {имя_экспорта}_export: один .md на диалог + один 00_profile_and_activity.md для профиля/связей/активности/тем.",
+        help="Один .md (или несколько по лимиту слов) вместо отдельного файла на каждый чат. По умолчанию: один файл на чат + 00_profile_and_activity.md.",
     )
     args = parser.parse_args()
 
@@ -888,8 +906,8 @@ def main() -> int:
     export_folder_name = os.path.basename(os.path.normpath(export_root))
     max_words = args.max_words if args.max_words > 0 else 0
 
-    if args.split_by_chats:
-        # Режим: папка {имя}_export, один .md на диалог + 00_profile_and_activity.md
+    if not args.single_file:
+        # Режим по умолчанию: папка {имя}_export, один .md на диалог + 00_profile_and_activity.md
         out_dir = os.path.join(args.output, export_folder_name + "_export")
         os.makedirs(out_dir, exist_ok=True)
         progress("Загрузка профиля и связей...", 5)
@@ -908,10 +926,28 @@ def main() -> int:
             f.write(profile_md)
         written = [profile_path]
 
+        # Для возобновления: если запуск повторный, собираем уже существующие файлы чатов
+        existing_basenames: set[str] = set()
+        try:
+            for fn in os.listdir(out_dir):
+                if not fn.endswith(".md"):
+                    continue
+                if fn == "00_profile_and_activity.md":
+                    continue
+                base, _ext = os.path.splitext(fn)
+                existing_basenames.add(base)
+        except OSError:
+            existing_basenames = set()
+
         progress("Загрузка переписок...", 20)
         conversations = load_inbox_conversations(
             export_root, transcribe_fn, log=progress, collapse_actions=args.collapse_actions
         )
+        if not conversations:
+            print(
+                "Предупреждение: переписки не найдены (0 чатов). Проверьте: 1) при запросе экспорта в Instagram выбраны «Сообщения»; 2) в папке экспорта есть your_instagram_activity/messages/inbox/ с подпапками чатов.",
+                flush=True,
+            )
         progress("Запись чатов...", 90)
         used_names: set[str] = set()
         for chat_name, lines in conversations:
@@ -923,6 +959,14 @@ def main() -> int:
             else:
                 display_name_for_file = safe_title
             base_name = _sanitize_filename(display_name_for_file)
+
+            # Если для этого base_name уже есть файл(ы) (прошлый запуск) — пропускаем чат (простое возобновление)
+            if any(
+                b == base_name or b.startswith(base_name + "_")
+                for b in existing_basenames
+            ):
+                continue
+
             name = base_name
             c = 1
             while name in used_names:
@@ -952,7 +996,7 @@ def main() -> int:
             print(f"  {p}", flush=True)
         return 0
 
-    # Режим по умолчанию: один (или несколько по словам) .md в dist/{имя}/
+    # Режим --single-file: один (или несколько по словам) .md в dist/{имя}/
     md = build_markdown(export_root, transcribe_fn, log=progress, collapse_actions=args.collapse_actions)
     out_dir = os.path.join(args.output, export_folder_name)
     os.makedirs(out_dir, exist_ok=True)
