@@ -1,48 +1,116 @@
 # Instagram Export → NotebookLM
 
-This project processes **Instagram data export only** (logs, DMs, profile, activity) and converts it into a single Markdown file for [NotebookLM](https://notebooklm.google/).
+Takes an **Instagram data export** (JSON) and turns it into Markdown for [NotebookLM](https://notebooklm.google/): profile, connections, DMs, activity, and suggested topics. Voice messages can be transcribed with Whisper. Output is one big `.md` (or split by word limit), or one `.md` per chat plus a shared profile/activity file.
+
+---
 
 ## How it works
 
-1. **Instagram** — download your data via Settings → Account → Download your information (JSON format).
-2. Put the export folder in **src/** (or pass its path as an argument).
-3. Run **instagram_export_to_md.py** — the script builds one `.md` with sections:
-   - **Profile** (name, username, email, date of birth, etc.)
-   - **Connections** (following, followers, close friends)
-   - **Conversations** (all inbox chats, messages in chronological order)
-   - **Activity** (liked posts and comments, saved posts, Threads posts, your comments)
-   - **Suggested topics**
-4. Output: `dist/<export_folder_name>/<export_folder_name>_notebooklm.md` — ready to upload to NotebookLM.
+1. Request your data from Instagram (Settings → Account → Download your information, JSON).
+2. Put the unzipped export folder in **src/** or pass its path.
+3. Run **instagram_export_to_md.py**. It reads the export, normalizes text and emoji, optionally transcribes voice messages (Whisper), and writes Markdown to **dist/**.
+4. **Default output:** one file (or several by word limit) in `dist/<export_folder_name>/`.  
+   **With `--split-by-chats`:** folder `dist/<export_folder_name>_export/` with one `.md` per conversation (named by the other participant) and `00_profile_and_activity.md`.
 
-Media (photos/videos) are not included; voice messages can optionally be transcribed via Whisper.
+Photos and videos are not included; only text, links, and transcribed audio.
+
+---
 
 ## Setup
 
 ```bash
 python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 # Optional, for voice transcription:
-pip install openai-whisper   # and install ffmpeg on your system
+pip install openai-whisper   # requires ffmpeg
 ```
+
+---
 
 ## Commands
 
-| Command | Description |
-|--------|-------------|
-| `python3 instagram_export_to_md.py` | Convert: export folder from **src/** → **dist/** |
-| `python3 instagram_export_to_md.py src/MyInstagramExport` | Specify Instagram export folder |
-| `python3 instagram_export_to_md.py -o /path/to/out` | Output directory for .md (default **dist/**) |
-| `python3 instagram_export_to_md.py --no-transcribe` | Skip voice transcription (faster) |
-| `python3 instagram_export_to_md.py --max-words 450000` | Max words per file for NotebookLM; when exceeded, multiple `*_notebooklm_1.md`, `*_2.md` … are written (default: 450000; use `0` for a single file) |
+**Basic run** (export from `src/` → `dist/`):
 
-## Instagram export requirements
+```bash
+python3 instagram_export_to_md.py
+```
 
-The export folder must contain at its root:
+**Custom input folder:**
+
+```bash
+python3 instagram_export_to_md.py /path/to/MyInstagramExport
+```
+
+**Custom output folder:**
+
+```bash
+python3 instagram_export_to_md.py -o /path/to/output
+```
+
+**Skip voice transcription** (faster):
+
+```bash
+python3 instagram_export_to_md.py --no-transcribe
+```
+
+**Limit words per file** (for NotebookLM; default 450000; use `0` for a single file):
+
+```bash
+python3 instagram_export_to_md.py --max-words 450000
+```
+
+**One .md per chat** plus profile/activity file (filenames = other participant names):
+
+```bash
+python3 instagram_export_to_md.py --split-by-chats
+```
+
+**Collapse consecutive “Liked a message” / “Reacted …”** into one line:
+
+```bash
+python3 instagram_export_to_md.py --collapse-actions
+```
+
+**Whisper model** (default `medium`; `tiny` = faster, `large` = best quality):
+
+```bash
+python3 instagram_export_to_md.py --whisper-model small
+```
+
+**Example:** split by chats, no transcription, custom output:
+
+```bash
+python3 instagram_export_to_md.py src/ -o dist/ --split-by-chats --no-transcribe
+```
+
+---
+
+## Whisper models (`--whisper-model`)
+
+Default is **medium**. Comparison:
+
+| Model   | Parameters | Speed     | Quality   | RAM   | Disk  |
+|---------|------------|-----------|-----------|-------|-------|
+| **tiny**  | ~39M   | Faster    | Lower     | ~1 GB | ~75 MB  |
+| **base**  | ~74M   | Faster    | Medium    | ~1 GB | ~150 MB |
+| **small** | ~244M  | Faster    | Good      | ~2 GB | ~500 MB |
+| **medium** | ~769M | **(default)** | High   | ~5 GB | ~1.5 GB |
+| **large** | ~1.5B  | Slower    | Highest   | ~10 GB| ~3 GB   |
+
+- **Faster, lower quality:** `--whisper-model tiny`
+- **Better quality, slower:** `--whisper-model small` or `medium`
+- **Best quality:** `--whisper-model large`
+
+---
+
+## Export folder requirements
+
+The Instagram export root must contain:
 
 - `personal_information/personal_information/personal_information.json`
 - `your_instagram_activity/messages/inbox/`
 
-The script can find this folder in nested subfolders inside **src/** as well.
+The script also looks for this structure in nested folders under the path you pass.
 
 ---
 
-This repo also contains **export_to_md.py** (Telegram export) and **split_json.py** (splitting large JSON files) — they are not used for Instagram and are kept for related use cases.
+This repo also includes **export_to_md.py** (Telegram) and **split_json.py**; they are separate from the Instagram flow.

@@ -34,6 +34,14 @@ _WS_RE = re.compile(r"\s+")
 # NEL (U+0085), CR, and Unicode line/paragraph separators → space so output uses only LF
 _LINE_BREAKS_RE = re.compile(r"[\r\u0085\u2028\u2029]+")
 _MOJIBAKE_RE = re.compile(r"[ÐÑ][\x80-\xBF]")
+# Словарь известных сломанных последовательностей (Instagram export) → корректный эмодзи
+_BROKEN_EMOJI_MAP = {
+    "â¤": "❤️",
+    "âºï¸": "☕️",
+    "âºï¸ï¸": "☕️",
+}
+# Паттерн: 2–4 символа в диапазоне Latin-1 (могут быть байты UTF-8, прочитанные как Latin-1)
+_BROKEN_EMOJI_RUN_RE = re.compile(r"[\u0080-\u00ff]{2,4}")
 _whisper_model = None
 
 
@@ -67,11 +75,44 @@ def _maybe_fix_mojibake(s: str) -> str:
     return s
 
 
+def _fix_broken_emoji(s: str) -> str:
+    """
+    Исправляет сломанные эмодзи в тексте из экспорта Instagram (ð/â и т.п.):
+    сначала замены по словарю, затем попытка перепаковать последовательности
+    Latin-1 как UTF-8 и заменить на один символ, если это эмодзи/символ.
+    """
+    if not s:
+        return s
+    for broken, emoji in _BROKEN_EMOJI_MAP.items():
+        s = s.replace(broken, emoji)
+    result = []
+    pos = 0
+    for m in _BROKEN_EMOJI_RUN_RE.finditer(s):
+        result.append(s[pos : m.start()])
+        try:
+            decoded = m.group(0).encode("latin-1").decode("utf-8")
+            if len(decoded) == 1:
+                cp = ord(decoded)
+                # Эмодзи/символы: доп. символы, эмодзи, вариационные селекторы
+                if cp >= 0x1F300 and cp <= 0x1F9FF or cp in (0x2764, 0x2615, 0xFE0F) or 0x1F600 <= cp <= 0x1F64F:
+                    result.append(decoded)
+                else:
+                    result.append(m.group(0))
+            else:
+                result.append(m.group(0))
+        except (UnicodeDecodeError, UnicodeEncodeError):
+            result.append(m.group(0))
+        pos = m.end()
+    result.append(s[pos:])
+    return "".join(result)
+
+
 def _normalize_output_text(s: str, max_len: int | None = None) -> str:
     """Normalizes text for MD output: mojibake fix, NEL/CR/Unicode line breaks → space, collapse whitespace. Optionally truncate to max_len."""
     if not s:
         return ""
     s = _maybe_fix_mojibake(s)
+    s = _fix_broken_emoji(s)
     s = _LINE_BREAKS_RE.sub(" ", s)
     s = _WS_RE.sub(" ", s).strip()
     if max_len is not None and len(s) > max_len:
@@ -114,7 +155,7 @@ def find_instagram_export_root(path: str) -> str | None:
     return None
 
 
-def transcribe_audio(file_path: str, model_size: str = "base") -> str:
+def transcribe_audio(file_path: str, model_size: str = "medium") -> str:
     """
     Транскрибирует аудио/видео через Whisper. Возвращает текст или пустую строку при ошибке.
     Требует: pip install openai-whisper и ffmpeg в системе.
@@ -246,18 +287,18 @@ def _message_text(msg: dict, export_root: str, transcribe_fn) -> str:
     share = msg.get("share")
     audio_files = msg.get("audio_files") or []
 
-    # Голосовое сообщение
+    # Голосовое сообщение — перед текстом ставим метку (Аудио)
     if audio_files:
         uri = audio_files[0].get("uri") if isinstance(audio_files[0], dict) else None
         if uri:
             full_path = os.path.join(export_root, uri)
             text = transcribe_fn(full_path) if transcribe_fn else ""
             if text:
-                parts.append(text)
+                parts.append("(Аудио) " + text)
             else:
-                parts.append("[Голосовое сообщение: не удалось распознать]")
+                parts.append("(Аудио) [Голосовое сообщение: не удалось распознать]")
         else:
-            parts.append("[Голосовое сообщение]")
+            parts.append("(Аудио) [Голосовое сообщение]")
 
     # Текст (если не служебная подпись к шарингу)
     if content and content not in ("You sent an attachment.", "Liked a message"):
@@ -297,11 +338,41 @@ def _log_noop(_msg: str, _pct: int | None = None) -> None:
     pass
 
 
-def load_inbox_conversations(root: str, transcribe_fn, log=None) -> list[tuple[str, list[str]]]:
+def _is_action_line(line: str) -> bool:
+    """Строка — только «Liked a message» или «Reacted … to your message» (служебное действие)."""
+    parts = line.split(" | ", 2)
+    if len(parts) < 3:
+        return False
+    text = parts[2].strip()
+    return text.startswith("Liked a message") or text.startswith("Reacted ")
+
+
+def _collapse_action_lines(lines: list[str]) -> list[str]:
+    """Подряд идущие строки «Liked a message» / «Reacted …» заменяет одной строкой «— Несколько лайков/реакций подряд»."""
+    if not lines:
+        return []
+    out = []
+    i = 0
+    while i < len(lines):
+        if _is_action_line(lines[i]) and i + 1 < len(lines) and _is_action_line(lines[i + 1]):
+            # Начало блока действий: собираем все подряд
+            first = lines[i]
+            date_part = first.split(" | ", 1)[0] if " | " in first else "-"
+            while i < len(lines) and _is_action_line(lines[i]):
+                i += 1
+            out.append(f"{date_part} | — | Несколько лайков/реакций подряд")
+        else:
+            out.append(lines[i])
+            i += 1
+    return out
+
+
+def load_inbox_conversations(root: str, transcribe_fn, log=None, collapse_actions: bool = False) -> list[tuple[str, list[str]]]:
     """
     Загружает все чаты из inbox. Возвращает список (имя_чата, [строки Markdown]).
     transcribe_fn(file_path) -> str или None (тогда плейсхолдер для аудио).
     log(msg, pct=None) — опциональный вывод прогресса; pct — общий прогресс 0–100.
+    collapse_actions: подряд идущие «Liked a message» / «Reacted …» сворачивать в одну строку.
     """
     if log is None:
         log = _log_noop
@@ -352,6 +423,9 @@ def load_inbox_conversations(root: str, transcribe_fn, log=None) -> list[tuple[s
                 dt = str(ts)
             sender = _normalize_output_text(msg.get("sender_name") or "")
             text = _message_text(msg, root, transcribe_fn)
+            # Не выводить служебные сообщения: только «Liked a message» или «Reacted …»
+            if text == "Liked a message" or text.strip().startswith("Reacted "):
+                continue
             reactions = _format_reactions(msg.get("reactions") or [])
             line = f"- {dt} | {sender} | {text}{reactions}"
             lines.append(line)
@@ -360,6 +434,8 @@ def load_inbox_conversations(root: str, transcribe_fn, log=None) -> list[tuple[s
                 (msg_idx + 1) % CHAT_PROGRESS_INTERVAL == 0 or (msg_idx + 1) == total_msgs
             ):
                 log(f"      обработано {msg_idx + 1}/{total_msgs} сообщ.")
+        if collapse_actions:
+            lines = _collapse_action_lines(lines)
         conversations.append((chat_name, lines))
     return conversations
 
@@ -465,11 +541,122 @@ def load_topics(root: str) -> list[str]:
 # --- Сборка Markdown ---
 
 
+def _sanitize_filename(name: str, max_len: int = 120) -> str:
+    """Делает из строки безопасное имя файла: убирает/заменяет недопустимые символы, ограничивает длину."""
+    if not name or not name.strip():
+        return "chat_unnamed"
+    s = name.strip()
+    for ch in r'\/:*?"<>|':
+        s = s.replace(ch, "_")
+    s = _WS_RE.sub("_", s)
+    while "__" in s:
+        s = s.replace("__", "_")
+    s = s.strip("_")
+    if not s:
+        return "chat_unnamed"
+    if len(s) > max_len:
+        s = s[:max_len].rstrip("_")
+    return s or "chat_unnamed"
+
+
+def build_profile_and_activity_md(
+    root: str,
+    username: str = "Instagram",
+    log=None,
+) -> str:
+    """Собирает один Markdown: заголовок, профиль, связи, активность, комментарии, темы (без переписок)."""
+    if log is None:
+        log = _log_noop
+    sections = []
+    sections.append(f"# Instagram Export — {username}\n")
+    sections.append("## Профиль\n")
+    profile_lines = load_profile(root)
+    sections.extend(profile_lines if profile_lines else ["- Нет данных"])
+    sections.append("")
+
+    sections.append("## Социальные связи\n")
+    conn = load_connections(root)
+    if conn.get("following"):
+        sections.append("### Подписки (following)\n")
+        for name, _ts in conn["following"][:500]:
+            sections.append(f"- {name}")
+        sections.append("")
+    if conn.get("followers"):
+        sections.append("### Подписчики (followers)\n")
+        for name, _ts in conn["followers"][:500]:
+            sections.append(f"- {name}")
+        sections.append("")
+    if conn.get("close_friends"):
+        sections.append("### Близкие друзья\n")
+        for name, _ts in conn["close_friends"]:
+            sections.append(f"- {name}")
+        sections.append("")
+
+    sections.append("## Активность\n")
+    act = load_activity(root)
+    if act["liked_posts"]:
+        sections.append("### Лайки постов\n")
+        for title, href, ts in act["liked_posts"][:300]:
+            try:
+                dt = datetime.utcfromtimestamp(ts).strftime(DATE_FMT) if ts else ""
+            except (OSError, ValueError):
+                dt = ""
+            sections.append(f"- {dt} | {title} | {href}")
+        sections.append("")
+    if act["liked_comments"]:
+        sections.append("### Лайки комментариев\n")
+        for title, href, ts in act["liked_comments"][:200]:
+            try:
+                dt = datetime.utcfromtimestamp(ts).strftime(DATE_FMT) if ts else ""
+            except (OSError, ValueError):
+                dt = ""
+            sections.append(f"- {dt} | {title} | {href}")
+        sections.append("")
+    if act["saved_posts"]:
+        sections.append("### Сохранённые посты\n")
+        for title, href, ts in act["saved_posts"][:300]:
+            try:
+                dt = datetime.utcfromtimestamp(ts).strftime(DATE_FMT) if ts else ""
+            except (OSError, ValueError):
+                dt = ""
+            sections.append(f"- {dt} | {title} | {href}")
+        sections.append("")
+    if act["threads_posts"]:
+        sections.append("### Посты Threads\n")
+        for title, uri, ts in act["threads_posts"][:100]:
+            try:
+                dt = datetime.utcfromtimestamp(ts).strftime(DATE_FMT) if ts else ""
+            except (OSError, ValueError):
+                dt = ""
+            sections.append(f"- {dt} | {title} | {uri}")
+        sections.append("")
+
+    sections.append("### Мои комментарии\n")
+    comments = load_comments(root)
+    for ts, owner, text in comments[:300]:
+        try:
+            dt = datetime.utcfromtimestamp(ts).strftime(DATE_FMT) if ts else ""
+        except (OSError, ValueError):
+            dt = ""
+        sections.append(f"- {dt} | {owner} | {text[:200]}")
+    sections.append("")
+
+    sections.append("## Повторяющиеся темы\n")
+    topics = load_topics(root)
+    for t in topics:
+        sections.append(f"- {t}")
+    if not topics:
+        sections.append("- Нет данных")
+    sections.append("")
+    return "\n".join(sections)
+
+
 def build_markdown(
     root: str,
     transcribe_fn,
     username_fallback: str = "Instagram",
     log=None,
+    collapse_actions: bool = False,
 ) -> str:
     """Собирает один Markdown-документ из всех разделов. log(msg, pct=None) — опциональный вывод прогресса; pct 0–100."""
     if log is None:
@@ -514,7 +701,7 @@ def build_markdown(
 
     # Переписки
     sections.append("## Переписки\n")
-    conversations = load_inbox_conversations(root, transcribe_fn, log=log)
+    conversations = load_inbox_conversations(root, transcribe_fn, log=log, collapse_actions=collapse_actions)
     log(f"  Переписки обработаны: {len(conversations)} чатов.", 80)
     for i, (chat_name, lines) in enumerate(conversations):
         safe_title = chat_name.replace("\n", " ").strip() or "Без имени"
@@ -644,11 +831,27 @@ def main() -> int:
         help="Не транскрибировать голосовые сообщения (быстрее, в логе будет плейсхолдер)",
     )
     parser.add_argument(
+        "--whisper-model",
+        default="medium",
+        choices=["tiny", "base", "small", "medium", "large"],
+        help="Модель Whisper: tiny (быстрее, меньше точность) — large (медленнее, качественнее). По умолчанию: medium.",
+    )
+    parser.add_argument(
         "--max-words",
         type=int,
         default=DEFAULT_MAX_WORDS_PER_FILE,
         metavar="N",
         help=f"Макс. слов в одном .md для NotebookLM (при превышении — несколько файлов). 0 = один файл. По умолчанию: {DEFAULT_MAX_WORDS_PER_FILE}",
+    )
+    parser.add_argument(
+        "--collapse-actions",
+        action="store_true",
+        help="Подряд идущие «Liked a message» / «Reacted …» сворачивать в одну строку «Несколько лайков/реакций подряд».",
+    )
+    parser.add_argument(
+        "--split-by-chats",
+        action="store_true",
+        help="В dist создавать папку {имя_экспорта}_export: один .md на диалог + один 00_profile_and_activity.md для профиля/связей/активности/тем.",
     )
     args = parser.parse_args()
 
@@ -671,26 +874,91 @@ def main() -> int:
         print(msg, flush=True)
 
     print(f"Экспорт Instagram: {export_root}", flush=True)
-    transcribe_fn = None if args.no_transcribe else transcribe_audio
+    transcribe_fn = None if args.no_transcribe else (lambda path: transcribe_audio(path, model_size=args.whisper_model))
     if args.no_transcribe:
         print("Транскрипция голосовых: отключена.", flush=True)
     else:
         try:
             import whisper  # noqa: F401
-            print("Транскрипция голосовых: включена (Whisper).", flush=True)
+            print(f"Транскрипция голосовых: включена (Whisper, модель {args.whisper_model}).", flush=True)
         except ImportError:
             print("Предупреждение: Whisper не установлен. Голосовые будут помечены плейсхолдером. Установите: pip install openai-whisper (нужен ffmpeg).", flush=True)
             transcribe_fn = None
 
-    md = build_markdown(export_root, transcribe_fn, log=progress)
     export_folder_name = os.path.basename(os.path.normpath(export_root))
+    max_words = args.max_words if args.max_words > 0 else 0
+
+    if args.split_by_chats:
+        # Режим: папка {имя}_export, один .md на диалог + 00_profile_and_activity.md
+        out_dir = os.path.join(args.output, export_folder_name + "_export")
+        os.makedirs(out_dir, exist_ok=True)
+        progress("Загрузка профиля и связей...", 5)
+        profile_lines = load_profile(export_root)
+        username = "Instagram"
+        owner_display_name: str | None = None
+        for line in profile_lines:
+            if line.startswith("- Username:"):
+                username = line.replace("- Username:", "").strip()
+            if line.startswith("- Имя:"):
+                owner_display_name = line.replace("- Имя:", "").strip()
+        progress("Сборка профиля и активности...", 10)
+        profile_md = build_profile_and_activity_md(export_root, username=username, log=progress)
+        profile_path = os.path.join(out_dir, "00_profile_and_activity.md")
+        with open(profile_path, "w", encoding="utf-8") as f:
+            f.write(profile_md)
+        written = [profile_path]
+
+        progress("Загрузка переписок...", 20)
+        conversations = load_inbox_conversations(
+            export_root, transcribe_fn, log=progress, collapse_actions=args.collapse_actions
+        )
+        progress("Запись чатов...", 90)
+        used_names: set[str] = set()
+        for chat_name, lines in conversations:
+            safe_title = chat_name.replace("\n", " ").strip() or "Без имени"
+            # Имя файла = ник собеседника (без владельца экспорта). Если группа — все остальные участники.
+            if owner_display_name:
+                other_parts = [p.strip() for p in chat_name.split(",") if p.strip() and p.strip() != owner_display_name]
+                display_name_for_file = ", ".join(other_parts) if other_parts else safe_title
+            else:
+                display_name_for_file = safe_title
+            base_name = _sanitize_filename(display_name_for_file)
+            name = base_name
+            c = 1
+            while name in used_names:
+                name = f"{base_name}_{c}"
+                c += 1
+            used_names.add(name)
+            chat_md = f"# Чат: {safe_title}\n\n" + "\n".join(lines)
+            if max_words > 0 and len(chat_md.split()) > max_words:
+                part_header = f"# Чат: {{title}} (часть {{n}} из {{total}})\n\n"
+                part_header_template = part_header.replace("{title}", safe_title[:50] + "…" if len(safe_title) > 50 else safe_title)
+                chunks = _split_md_by_words(chat_md, max_words, part_header_template)
+                for i, chunk in enumerate(chunks):
+                    part_name = f"{name}_{i + 1}" if len(chunks) > 1 else name
+                    used_names.add(part_name)
+                    out_path = os.path.join(out_dir, f"{part_name}.md")
+                    with open(out_path, "w", encoding="utf-8") as f:
+                        f.write(chunk)
+                    written.append(out_path)
+            else:
+                out_path = os.path.join(out_dir, f"{name}.md")
+                with open(out_path, "w", encoding="utf-8") as f:
+                    f.write(chat_md)
+                written.append(out_path)
+        print("Общий прогресс: 100%", flush=True)
+        print(f"Готово: папка {out_dir}, {len(written)} файл(ов) (1 профиль + {len(conversations)} чатов).", flush=True)
+        for p in written:
+            print(f"  {p}", flush=True)
+        return 0
+
+    # Режим по умолчанию: один (или несколько по словам) .md в dist/{имя}/
+    md = build_markdown(export_root, transcribe_fn, log=progress, collapse_actions=args.collapse_actions)
     out_dir = os.path.join(args.output, export_folder_name)
     os.makedirs(out_dir, exist_ok=True)
     total_words = len(md.split())
-    max_words = args.max_words if args.max_words > 0 else 0
     if max_words > 0 and total_words > max_words:
         part_header = f"# Instagram Export — {{username}} (часть {{n}} из {{total}})\n\n"
-        # Подставляем username из первой строки md (например "# Instagram Export — br_hum4n")
         first_line = md.split("\n")[0] if md else ""
         username = first_line.replace("# Instagram Export —", "").strip() or "Instagram"
         part_header_template = part_header.replace("{username}", username)
