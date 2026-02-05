@@ -32,6 +32,7 @@ pip install openai-whisper   # and install ffmpeg on your system
 | `python3 instagram_export_to_md.py src/MyInstagramExport` | Specify Instagram export folder |
 | `python3 instagram_export_to_md.py -o /path/to/out` | Output directory for .md (default **dist/**) |
 | `python3 instagram_export_to_md.py --no-transcribe` | Skip voice transcription (faster) |
+| `python3 instagram_export_to_md.py --max-words 450000` | Max words per file for NotebookLM; when exceeded, multiple `*_notebooklm_1.md`, `*_2.md` … are written (default: 450000; use `0` for a single file) |
 
 ## Instagram export requirements
 

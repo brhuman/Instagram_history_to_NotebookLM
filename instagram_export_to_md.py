@@ -25,8 +25,15 @@ DEFAULT_DIST = os.path.join(SCRIPT_DIR, "dist")
 DATE_FMT = "%Y-%m-%d %H:%M"
 # Как часто выводить прогресс внутри одного чата (по сообщениям)
 CHAT_PROGRESS_INTERVAL = 100
+# Макс. длина одной строки сообщения в dist (обрезаем длинные хештеги/контент)
+MAX_MESSAGE_LINE_CHARS = 2000
+# Лимит слов на один файл для NotebookLM (500k макс., берём 450k с запасом)
+DEFAULT_MAX_WORDS_PER_FILE = 450_000
 
 _WS_RE = re.compile(r"\s+")
+# NEL (U+0085), CR, and Unicode line/paragraph separators → space so output uses only LF
+_LINE_BREAKS_RE = re.compile(r"[\r\u0085\u2028\u2029]+")
+_MOJIBAKE_RE = re.compile(r"[ÐÑ][\x80-\xBF]")
 _whisper_model = None
 
 
@@ -37,13 +44,48 @@ def _normalize_text(s: str) -> str:
     return _WS_RE.sub(" ", s).strip()
 
 
+def _maybe_fix_mojibake(s: str) -> str:
+    """
+    Пытается поправить типичный моибайк (UTF-8, прочитанный как Latin-1).
+    Эвристика: если есть паттерн 'Ð'/'Ñ', пробуем перепаковать.
+    Возвращаем исходное, если не стало лучше (меньше кириллицы или появились �).
+    """
+    if not s or ("Ð" not in s and "Ñ" not in s):
+        return s
+    try:
+        candidate = s.encode("latin-1").decode("utf-8")
+    except Exception:
+        return s
+
+    def _score(text: str) -> float:
+        cyr = sum("А" <= ch <= "я" or ch in ("ё", "Ё") for ch in text)
+        repl = text.count("�")
+        return cyr * 2 - repl
+
+    if _score(candidate) > _score(s):
+        return candidate
+    return s
+
+
+def _normalize_output_text(s: str, max_len: int | None = None) -> str:
+    """Normalizes text for MD output: mojibake fix, NEL/CR/Unicode line breaks → space, collapse whitespace. Optionally truncate to max_len."""
+    if not s:
+        return ""
+    s = _maybe_fix_mojibake(s)
+    s = _LINE_BREAKS_RE.sub(" ", s)
+    s = _WS_RE.sub(" ", s).strip()
+    if max_len is not None and len(s) > max_len:
+        s = s[: max_len - 1].rstrip() + "…"
+    return s
+
+
 def load_json_safe(root: str, *path_parts: str) -> dict | list | None:
     """Читает JSON по относительному пути от root. При ошибке возвращает None."""
     path = os.path.join(root, *path_parts)
     if not os.path.isfile(path):
         return None
     try:
-        with open(path, "r", encoding="utf-8") as f:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
             return json.load(f)
     except (json.JSONDecodeError, OSError):
         return None
@@ -116,7 +158,7 @@ def load_profile(root: str) -> list[str]:
         ]
         for key, label in fields:
             if key in sm and sm[key].get("value"):
-                lines.append(f"- {label}: {sm[key]['value']}")
+                lines.append(f"- {label}: {_normalize_output_text(sm[key]['value'])}")
     return lines
 
 
@@ -157,7 +199,7 @@ def load_connections(root: str) -> dict[str, list[tuple[str, int]]]:
     # following
     data = load_json_safe(root, *base, "following.json")
     if data and "relationships_following" in data:
-        out["following"] = [(item.get("title", ""), (item.get("string_list_data") or [{}])[0].get("timestamp", 0)) for item in data["relationships_following"] if item.get("title")]
+        out["following"] = [(_normalize_output_text(item.get("title", "")), (item.get("string_list_data") or [{}])[0].get("timestamp", 0)) for item in data["relationships_following"] if item.get("title")]
     else:
         out["following"] = []
     # followers (followers_1.json, followers_2.json ...) — может быть массив в корне или объект с ключом
@@ -170,10 +212,10 @@ def load_connections(root: str) -> dict[str, list[tuple[str, int]]]:
         arr = data if isinstance(data, list) else data.get("relationships_followers", data.get("relationships_following", []))
         for item in arr or []:
             sl = (item.get("string_list_data") or [{}])[0]
-            title = (item.get("title") or sl.get("value", "")).strip()
+            title = _normalize_output_text(item.get("title") or sl.get("value", ""))
             ts = sl.get("timestamp", 0)
             if not title and isinstance(sl.get("value"), str):
-                title = sl["value"]
+                title = _normalize_output_text(sl["value"])
             if title:
                 followers.append((title, ts))
     out["followers"] = followers
@@ -183,7 +225,7 @@ def load_connections(root: str) -> dict[str, list[tuple[str, int]]]:
         out["close_friends"] = []
         for item in data["relationships_close_friends"]:
             for sl in (item.get("string_list_data") or []):
-                val = sl.get("value", "").strip()
+                val = _normalize_output_text(sl.get("value", ""))
                 if val:
                     out["close_friends"].append((val, sl.get("timestamp", 0)))
     else:
@@ -200,7 +242,7 @@ def _message_text(msg: dict, export_root: str, transcribe_fn) -> str:
     transcribe_fn(path) -> str
     """
     parts = []
-    content = (msg.get("content") or "").strip()
+    content = _normalize_output_text(msg.get("content") or "")
     share = msg.get("share")
     audio_files = msg.get("audio_files") or []
 
@@ -226,9 +268,9 @@ def _message_text(msg: dict, export_root: str, transcribe_fn) -> str:
 
     # Шаринг: ссылка и подпись
     if share:
-        link = share.get("link", "")
-        share_text = (share.get("share_text") or "").strip()
-        owner = share.get("original_content_owner", "")
+        link = _normalize_output_text(share.get("link") or "")
+        share_text = _normalize_output_text(share.get("share_text") or "")
+        owner = _normalize_output_text(share.get("original_content_owner") or "")
         if link:
             parts.append(f"Поделился ссылкой: {link}")
         if share_text:
@@ -242,13 +284,13 @@ def _message_text(msg: dict, export_root: str, transcribe_fn) -> str:
 
     if not parts:
         return "[Сообщение без текста]"
-    return " ".join(parts).strip()
+    return _normalize_output_text(" ".join(parts), max_len=MAX_MESSAGE_LINE_CHARS)
 
 
 def _format_reactions(reactions: list) -> str:
     if not reactions:
         return ""
-    return " " + " ".join(f"({r.get('actor', '')}: {r.get('reaction', '')})" for r in reactions)
+    return " " + " ".join(f"({_normalize_output_text(r.get('actor', ''))}: {_normalize_output_text(r.get('reaction', ''))})" for r in reactions)
 
 
 def _log_noop(_msg: str, _pct: int | None = None) -> None:
@@ -281,7 +323,7 @@ def load_inbox_conversations(root: str, transcribe_fn, log=None) -> list[tuple[s
         participants_names = []
         for fpath in files:
             try:
-                with open(fpath, "r", encoding="utf-8") as f:
+                with open(fpath, "r", encoding="utf-8", errors="replace") as f:
                     data = json.load(f)
             except (json.JSONDecodeError, OSError):
                 continue
@@ -294,7 +336,7 @@ def load_inbox_conversations(root: str, transcribe_fn, log=None) -> list[tuple[s
         all_messages.sort(key=lambda m: m.get("timestamp_ms", 0))
 
         # Имя чата: участники (без владельца можно оставить всех)
-        chat_name = ", ".join(participants_names) if participants_names else folder
+        chat_name = ", ".join(_normalize_output_text(n) for n in participants_names) if participants_names else _normalize_output_text(folder)
         short_name = (chat_name[:50] + "…") if len(chat_name) > 50 else chat_name
         # Переписки занимают 10–80% общего прогресса
         pct = 10 + int(70 * (idx + 1) / total_folders) if total_folders else 80
@@ -308,7 +350,7 @@ def load_inbox_conversations(root: str, transcribe_fn, log=None) -> list[tuple[s
                 dt = datetime.utcfromtimestamp(ts / 1000.0).strftime(DATE_FMT)
             except (OSError, ValueError):
                 dt = str(ts)
-            sender = (msg.get("sender_name") or "").strip()
+            sender = _normalize_output_text(msg.get("sender_name") or "")
             text = _message_text(msg, root, transcribe_fn)
             reactions = _format_reactions(msg.get("reactions") or [])
             line = f"- {dt} | {sender} | {text}{reactions}"
@@ -346,7 +388,7 @@ def load_comments(root: str) -> list[tuple[int, str, str]]:
             owner = (sm.get("Media Owner") or {}).get("value", "")
             ts = (sm.get("Time") or {}).get("timestamp", 0)
             if comment or owner:
-                out.append((ts, owner, comment))
+                out.append((ts, _normalize_output_text(owner), _normalize_output_text(comment)))
     out.sort(key=lambda x: x[0], reverse=True)
     return out
 
@@ -363,7 +405,7 @@ def load_activity(root: str) -> dict[str, list]:
     data = load_json_safe(root, base_act, "likes", "liked_posts.json")
     if data and "likes_media_likes" in data:
         for item in data["likes_media_likes"]:
-            title = item.get("title", "")
+            title = _normalize_output_text(item.get("title", ""))
             for sl in (item.get("string_list_data") or []):
                 href = sl.get("href", "")
                 ts = sl.get("timestamp", 0)
@@ -373,7 +415,7 @@ def load_activity(root: str) -> dict[str, list]:
     data = load_json_safe(root, base_act, "likes", "liked_comments.json")
     if data and "likes_comment_likes" in data:
         for item in data["likes_comment_likes"]:
-            title = item.get("title", "")
+            title = _normalize_output_text(item.get("title", ""))
             for sl in (item.get("string_list_data") or []):
                 href = sl.get("href", "")
                 ts = sl.get("timestamp", 0)
@@ -383,7 +425,7 @@ def load_activity(root: str) -> dict[str, list]:
     data = load_json_safe(root, base_act, "saved", "saved_posts.json")
     if data and "saved_saved_media" in data:
         for item in data["saved_saved_media"]:
-            title = item.get("title", "")
+            title = _normalize_output_text(item.get("title", ""))
             sm = item.get("string_map_data") or {}
             saved = sm.get("Saved on", {})
             href = saved.get("href", "") if isinstance(saved, dict) else ""
@@ -395,7 +437,7 @@ def load_activity(root: str) -> dict[str, list]:
     if data and "text_post_app_text_posts" in data:
         for item in data["text_post_app_text_posts"]:
             for media in item.get("media", [])[:1]:
-                title = (media.get("title") or "").strip()
+                title = _normalize_output_text(media.get("title") or "")
                 ts = media.get("creation_timestamp", 0)
                 uri = media.get("uri", "")
                 out["threads_posts"].append((title, uri, ts))
@@ -416,7 +458,7 @@ def load_topics(root: str) -> list[str]:
         sm = item.get("string_map_data") or {}
         name = (sm.get("Name") or {}).get("value", "")
         if name:
-            topics.append(name.strip())
+            topics.append(_normalize_output_text(name))
     return topics
 
 
@@ -474,8 +516,10 @@ def build_markdown(
     sections.append("## Переписки\n")
     conversations = load_inbox_conversations(root, transcribe_fn, log=log)
     log(f"  Переписки обработаны: {len(conversations)} чатов.", 80)
-    for chat_name, lines in conversations:
+    for i, (chat_name, lines) in enumerate(conversations):
         safe_title = chat_name.replace("\n", " ").strip() or "Без имени"
+        if i > 0:
+            sections.append("\n---\n")
         sections.append(f"### Чат: {safe_title}\n")
         sections.extend(lines)
         sections.append("")
@@ -547,6 +591,38 @@ def build_markdown(
     return "\n".join(sections)
 
 
+def _split_md_by_words(md: str, max_words: int, part_header_template: str = "") -> list[str]:
+    """
+    Разбивает Markdown на части не более max_words слов каждая.
+    Режет по границам строк. part_header_template: строка для вставки в начало 2+ частей, например "# Instagram Export — user (часть {n} из {total})\n\n".
+    """
+    if max_words <= 0:
+        return [md]
+    lines = md.split("\n")
+    chunks: list[str] = []
+    current: list[str] = []
+    current_words = 0
+    for line in lines:
+        line_words = len(line.split())
+        if current_words + line_words > max_words and current:
+            chunks.append("\n".join(current))
+            current = [line]
+            current_words = line_words
+        else:
+            current.append(line)
+            current_words += line_words
+    if current:
+        chunks.append("\n".join(current))
+    if not part_header_template or len(chunks) <= 1:
+        return chunks
+    total = len(chunks)
+    out = [chunks[0]]
+    for i in range(1, total):
+        header = part_header_template.format(n=i + 1, total=total)
+        out.append(header + chunks[i])
+    return out
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Конвертация экспорта Instagram (JSON) в Markdown для NotebookLM."
@@ -566,6 +642,13 @@ def main() -> int:
         "--no-transcribe",
         action="store_true",
         help="Не транскрибировать голосовые сообщения (быстрее, в логе будет плейсхолдер)",
+    )
+    parser.add_argument(
+        "--max-words",
+        type=int,
+        default=DEFAULT_MAX_WORDS_PER_FILE,
+        metavar="N",
+        help=f"Макс. слов в одном .md для NotebookLM (при превышении — несколько файлов). 0 = один файл. По умолчанию: {DEFAULT_MAX_WORDS_PER_FILE}",
     )
     args = parser.parse_args()
 
@@ -603,13 +686,38 @@ def main() -> int:
     export_folder_name = os.path.basename(os.path.normpath(export_root))
     out_dir = os.path.join(args.output, export_folder_name)
     os.makedirs(out_dir, exist_ok=True)
-    out_name = export_folder_name + "_notebooklm.md"
-    out_path = os.path.join(out_dir, out_name)
-    progress("Запись в файл...", 98)
-    with open(out_path, "w", encoding="utf-8") as f:
-        f.write(md)
-    print("Общий прогресс: 100%", flush=True)
-    print(f"Готово: {out_path}", flush=True)
+    total_words = len(md.split())
+    max_words = args.max_words if args.max_words > 0 else 0
+    if max_words > 0 and total_words > max_words:
+        part_header = f"# Instagram Export — {{username}} (часть {{n}} из {{total}})\n\n"
+        # Подставляем username из первой строки md (например "# Instagram Export — br_hum4n")
+        first_line = md.split("\n")[0] if md else ""
+        username = first_line.replace("# Instagram Export —", "").strip() or "Instagram"
+        part_header_template = part_header.replace("{username}", username)
+        chunks = _split_md_by_words(md, max_words, part_header_template)
+        progress("Запись в файл...", 98)
+        written = []
+        for i, chunk in enumerate(chunks):
+            if len(chunks) == 1:
+                out_name = export_folder_name + "_notebooklm.md"
+            else:
+                out_name = export_folder_name + f"_notebooklm_{i + 1}.md"
+            out_path = os.path.join(out_dir, out_name)
+            with open(out_path, "w", encoding="utf-8") as f:
+                f.write(chunk)
+            written.append(out_path)
+        print("Общий прогресс: 100%", flush=True)
+        print(f"Готово: {len(written)} файл(ов), ~{total_words:,} слов → части по ≤{max_words:,} слов.", flush=True)
+        for p in written:
+            print(f"  {p}", flush=True)
+    else:
+        out_name = export_folder_name + "_notebooklm.md"
+        out_path = os.path.join(out_dir, out_name)
+        progress("Запись в файл...", 98)
+        with open(out_path, "w", encoding="utf-8") as f:
+            f.write(md)
+        print("Общий прогресс: 100%", flush=True)
+        print(f"Готово: {out_path}", flush=True)
     return 0
 
 
